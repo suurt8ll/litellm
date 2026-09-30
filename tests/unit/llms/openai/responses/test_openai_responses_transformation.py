@@ -14,6 +14,8 @@ from litellm.types.llms.openai import (
     ImageGenerationPartialImageEvent,
     OutputTextDeltaEvent,
     ResponseCompletedEvent,
+    ResponseCreatedEvent,
+    ResponseInProgressEvent,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
 )
@@ -472,6 +474,71 @@ class TestOpenAIResponsesAPIConfig:
 
             assert result.type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
             assert result.response.id == "resp_123"
+
+    def test_transform_streaming_response_normalizes_flat_lifecycle_event(self):
+        """Providers with alpha /responses implementations (e.g. Venice.ai) send
+        lifecycle events with the response object at the top level instead of
+        nested under a `response` key. The flat shape must be normalized to the
+        spec shape instead of being forwarded verbatim (strict clients such as
+        openai-node crash on `event.response.id`)."""
+        flat_chunk = {
+            "id": "resp_abc123",
+            "object": "response",
+            "created_at": 1234567890,
+            "model": "gpt-4o",
+            "status": "in_progress",
+            "output": [],
+            "type": "response.created",
+            "sequence_number": 0,
+        }
+
+        result = self.config.transform_streaming_response(
+            model=self.model, parsed_chunk=flat_chunk, logging_obj=self.logging_obj
+        )
+
+        assert isinstance(result, ResponseCreatedEvent)
+        assert result.type == ResponsesAPIStreamEvents.RESPONSE_CREATED
+        assert result.sequence_number == 0
+        assert result.response.id == "resp_abc123"
+        assert result.response.status == "in_progress"
+
+    def test_transform_streaming_response_normalizes_flat_in_progress_event(self):
+        flat_chunk = {
+            "id": "resp_abc123",
+            "object": "response",
+            "created_at": 1234567890,
+            "model": "gpt-4o",
+            "status": "in_progress",
+            "output": [],
+            "type": "response.in_progress",
+            "sequence_number": 1,
+        }
+
+        result = self.config.transform_streaming_response(
+            model=self.model, parsed_chunk=flat_chunk, logging_obj=self.logging_obj
+        )
+
+        assert isinstance(result, ResponseInProgressEvent)
+        assert result.type == ResponsesAPIStreamEvents.RESPONSE_IN_PROGRESS
+        assert result.sequence_number == 1
+        assert result.response.id == "resp_abc123"
+
+    def test_transform_streaming_response_lifecycle_event_without_id_falls_back(self):
+        """A lifecycle-event chunk that is not a flat response object (no `id`)
+        cannot be normalized and must keep the existing model_construct fallback."""
+        unrecognizable_chunk = {
+            "type": "response.created",
+            "sequence_number": 0,
+        }
+
+        result = self.config.transform_streaming_response(
+            model=self.model,
+            parsed_chunk=unrecognizable_chunk,
+            logging_obj=self.logging_obj,
+        )
+
+        assert result.type == ResponsesAPIStreamEvents.RESPONSE_CREATED
+        assert getattr(result, "response", None) is None
 
     @pytest.mark.serial
     def test_validate_environment(self):

@@ -648,12 +648,66 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         try:
             return event_pydantic_model(**parsed_chunk)
         except ValidationError:
+            # Some OpenAI-compatible providers with alpha /responses implementations
+            # (e.g. Venice.ai) emit lifecycle events with the response object at the
+            # top level instead of nested under a "response" key. Normalize the
+            # payload to the spec shape and retry before falling back.
+            normalized_chunk: Final = OpenAIResponsesAPIConfig._normalize_flat_lifecycle_event(
+                event_type=event_type, parsed_chunk=parsed_chunk
+            )
+            if normalized_chunk is not None:
+                try:
+                    return event_pydantic_model(**normalized_chunk)
+                except ValidationError:
+                    verbose_logger.debug(
+                        "Pydantic validation failed for %s with normalized chunk %s, falling back to model_construct",
+                        event_pydantic_model.__name__,
+                        normalized_chunk,
+                    )
             verbose_logger.debug(
                 "Pydantic validation failed for %s with chunk %s, falling back to model_construct",
                 event_pydantic_model.__name__,
                 parsed_chunk,
             )
             return event_pydantic_model.model_construct(**parsed_chunk)
+
+    @staticmethod
+    def _normalize_flat_lifecycle_event(event_type: str, parsed_chunk: dict) -> dict | None:
+        """
+        Normalize a non-conformant flat lifecycle event payload to the spec shape.
+
+        Some OpenAI-compatible providers send lifecycle events (response.created,
+        response.in_progress, ...) as a flat response object with `type` and
+        `sequence_number` alongside the response fields, instead of nesting the
+        response under a "response" key as the OpenAI Responses API spec requires.
+        Strict SDK clients crash on the flat shape (e.g. openai-node dereferences
+        `event.response.id` on `response.created`).
+
+        Returns the spec-shaped dict if the chunk looks like a flat response object,
+        otherwise None. Additive-only: conformant providers never hit this path
+        because their chunks pass validation on the first attempt.
+        """
+        lifecycle_event_types: Final = {
+            ResponsesAPIStreamEvents.RESPONSE_CREATED.value,
+            ResponsesAPIStreamEvents.RESPONSE_IN_PROGRESS.value,
+            ResponsesAPIStreamEvents.RESPONSE_COMPLETED.value,
+            ResponsesAPIStreamEvents.RESPONSE_FAILED.value,
+            ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE.value,
+        }
+        if event_type not in lifecycle_event_types:
+            return None
+        if "response" in parsed_chunk or "id" not in parsed_chunk:
+            return None
+        response_body: Final = {
+            key: value
+            for key, value in parsed_chunk.items()
+            if key not in ("type", "sequence_number")
+        }
+        return {
+            "type": event_type,
+            "sequence_number": parsed_chunk.get("sequence_number", 0),
+            "response": response_body,
+        }
 
     @staticmethod
     def parse_terminal_event_from_stream_chunks(all_chunks: Sequence[str]) -> ResponsesTerminalEvent | None:
